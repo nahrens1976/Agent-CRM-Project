@@ -40,3 +40,20 @@ create policy "No direct client access to contacts" on public.contacts for all t
 create policy "No direct client access to deals" on public.deals for all to anon, authenticated using (false) with check (false);
 create policy "No direct client access to activities" on public.activities for all to anon, authenticated using (false) with check (false);
 
+create table public.follow_up_drafts (
+  id uuid primary key default gen_random_uuid(), contact_id uuid not null references public.contacts(id) on delete cascade,
+  deal_id uuid not null references public.deals(id) on delete cascade, rationale text not null,
+  subject text not null, body text not null, suggested_next_action text not null,
+  status text not null default 'pending' check (status in ('pending','approved','rejected')),
+  created_at timestamptz not null default now(), reviewed_at timestamptz
+);
+create table public.agent_runs (
+  id uuid primary key default gen_random_uuid(), status text not null check (status in ('completed','failed')),
+  draft_count integer not null default 0, error text, created_at timestamptz not null default now()
+);
+alter table public.follow_up_drafts enable row level security;
+alter table public.agent_runs enable row level security;
+revoke all on public.follow_up_drafts, public.agent_runs from anon, authenticated;
+create policy "No direct client access to drafts" on public.follow_up_drafts for all to anon, authenticated using (false) with check (false);
+create policy "No direct client access to agent runs" on public.agent_runs for all to anon, authenticated using (false) with check (false);
+
