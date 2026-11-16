@@ -16,4 +16,8 @@ Railway uses `railway.toml` and starts the service with Gunicorn. Configure thes
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+- `OPENROUTER_API_KEY` (required for the review-only follow-up agent)
+- `OPENROUTER_MODEL` (optional; defaults to `openai/gpt-4o-mini`)
+
+The follow-up agent only generates drafts in the approval queue. It has no email-sending integration.
 
