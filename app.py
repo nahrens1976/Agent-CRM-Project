@@ -1,4 +1,7 @@
 import os
+import json
+import urllib.request
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -13,6 +16,83 @@ def db() -> Client:
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured")
     return create_client(url, key)
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def stalled_records(client):
+    """Return one actionable open opportunity per contact after seven quiet days."""
+    contacts = {row["id"]: row for row in client.table("contacts").select("*").execute().data}
+    activities = client.table("activities").select("contact_id, occurred_at").execute().data
+    deals = client.table("deals").select("*").execute().data
+    drafts = client.table("follow_up_drafts").select("contact_id").eq("status", "pending").execute().data
+    already_pending = {row["contact_id"] for row in drafts}
+    latest_activity = defaultdict(lambda: None)
+    for activity in activities:
+        occurred = parse_timestamp(activity["occurred_at"])
+        contact_id = activity["contact_id"]
+        if latest_activity[contact_id] is None or occurred > latest_activity[contact_id]:
+            latest_activity[contact_id] = occurred
+    cutoff = utcnow().timestamp() - 7 * 24 * 60 * 60
+    candidates = []
+    for deal in deals:
+        if deal["stage"] in ("won", "lost") or deal["contact_id"] in already_pending:
+            continue
+        last_activity = latest_activity[deal["contact_id"]]
+        deal_updated = parse_timestamp(deal["updated_at"])
+        is_quiet = (last_activity is None or last_activity.timestamp() < cutoff)
+        is_stale_deal = deal_updated.timestamp() < cutoff
+        if is_quiet or is_stale_deal:
+            reason = "No recorded activity in the last seven days" if is_quiet else "Opportunity has not been updated in the last seven days"
+            candidates.append({"contact": contacts[deal["contact_id"]], "deal": deal, "reason": reason, "last_activity": last_activity})
+    return candidates
+
+
+def openrouter_draft(context):
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY must be configured before drafting follow-ups")
+    prompt = f'''You are a careful B2B sales assistant. Write a warm, concise follow-up draft for this CRM record. Never claim an action was performed, never propose sending automatically, and do not invent facts. Return only valid JSON with keys: subject, body, suggested_next_action.\n\nContact: {context["contact"]["name"]}, {context["contact"].get("title") or ""} at {context["contact"].get("company") or "their company"}\nOpportunity: {context["deal"]["name"]}, stage {context["deal"]["stage"]}, value ${context["deal"]["value"]}\nStall signal: {context["reason"]}.'''
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/responses",
+        data=json.dumps({"model": os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"), "input": prompt}).encode(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "X-OpenRouter-Title": "Orbit CRM"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.load(response)
+    text = result.get("output_text")
+    if not text:
+        for item in result.get("output", []):
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text = part.get("text")
+                    break
+    if not text:
+        raise RuntimeError("OpenRouter did not return draft text")
+    return json.loads(text.strip().removeprefix("```json").removesuffix("```").strip())
+
+
+def run_follow_up_agent():
+    client = db()
+    candidates = stalled_records(client)
+    created = 0
+    for candidate in candidates:
+        draft = openrouter_draft(candidate)
+        client.table("follow_up_drafts").insert({
+            "contact_id": candidate["contact"]["id"], "deal_id": candidate["deal"]["id"],
+            "rationale": candidate["reason"], "subject": draft["subject"], "body": draft["body"],
+            "suggested_next_action": draft["suggested_next_action"], "status": "pending",
+        }).execute()
+        created += 1
+    client.table("agent_runs").insert({"status": "completed", "draft_count": created}).execute()
+    return created
 
 
 @app.get("/")
@@ -44,6 +124,36 @@ def dashboard():
             "pipeline": pipeline,
         },
     })
+
+
+@app.get("/api/follow-ups")
+def follow_ups():
+    drafts = db().table("follow_up_drafts").select("*, contacts(name, email, company), deals(name, value, stage)").order("created_at", desc=True).execute().data
+    return jsonify(drafts)
+
+
+@app.post("/api/follow-ups/<draft_id>/review")
+def review_follow_up(draft_id):
+    decision = request.get_json(force=True).get("decision")
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "Decision must be approved or rejected."}), 400
+    result = db().table("follow_up_drafts").update({"status": decision, "reviewed_at": utcnow().isoformat()}).eq("id", draft_id).eq("status", "pending").execute()
+    if not result.data:
+        return jsonify({"error": "Draft is no longer pending."}), 409
+    # Approval only records a human decision. This application has no email-sending code or integration.
+    return jsonify(result.data[0])
+
+
+@app.post("/api/agent/run")
+def run_agent():
+    token = request.headers.get("X-Agent-Token", "")
+    if not token or token != os.environ.get("AGENT_RUN_TOKEN"):
+        return jsonify({"error": "Unauthorized agent invocation."}), 401
+    try:
+        return jsonify({"drafts_created": run_follow_up_agent()})
+    except Exception as error:
+        db().table("agent_runs").insert({"status": "failed", "error": str(error), "draft_count": 0}).execute()
+        return jsonify({"error": "Agent run failed. Review server logs."}), 500
 
 
 @app.post("/api/contacts")
