@@ -8,6 +8,8 @@ from flask import Flask, jsonify, request, send_from_directory
 from supabase import Client, create_client
 
 app = Flask(__name__, static_folder="static")
+CONTACT_STATUSES = {"lead", "active", "customer", "inactive"}
+DEAL_STAGES = {"lead", "qualified", "proposal", "negotiation", "won", "lost"}
 
 
 def db() -> Client:
@@ -20,6 +22,17 @@ def db() -> Client:
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+def json_body():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None
+    return body
+
+
+def error(message, status=400):
+    return jsonify({"error": message}), status
 
 
 def parse_timestamp(value):
@@ -134,12 +147,15 @@ def follow_ups():
 
 @app.post("/api/follow-ups/<draft_id>/review")
 def review_follow_up(draft_id):
-    decision = request.get_json(force=True).get("decision")
+    payload = json_body()
+    if payload is None:
+        return error("A JSON decision is required.")
+    decision = payload.get("decision")
     if decision not in ("approved", "rejected"):
-        return jsonify({"error": "Decision must be approved or rejected."}), 400
+        return error("Decision must be approved or rejected.")
     result = db().table("follow_up_drafts").update({"status": decision, "reviewed_at": utcnow().isoformat()}).eq("id", draft_id).eq("status", "pending").execute()
     if not result.data:
-        return jsonify({"error": "Draft is no longer pending."}), 409
+        return error("Draft is no longer pending.", 409)
     # Approval only records a human decision. This application has no email-sending code or integration.
     return jsonify(result.data[0])
 
@@ -148,25 +164,32 @@ def review_follow_up(draft_id):
 def run_agent():
     token = request.headers.get("X-Agent-Token", "")
     if not token or token != os.environ.get("AGENT_RUN_TOKEN"):
-        return jsonify({"error": "Unauthorized agent invocation."}), 401
+        return error("Unauthorized agent invocation.", 401)
     try:
         return jsonify({"drafts_created": run_follow_up_agent()})
     except Exception as error:
         db().table("agent_runs").insert({"status": "failed", "error": str(error), "draft_count": 0}).execute()
-        return jsonify({"error": "Agent run failed. Review server logs."}), 500
+        return error("Agent run failed. Review server logs.", 500)
 
 
 @app.post("/api/contacts")
 def create_contact():
-    payload = request.get_json(force=True)
+    payload = json_body()
+    if payload is None:
+        return error("A JSON contact is required.")
     required = ("name", "email")
-    if any(not payload.get(field, "").strip() for field in required):
-        return jsonify({"error": "Name and email are required."}), 400
+    if any(not isinstance(payload.get(field), str) or not payload[field].strip() for field in required):
+        return error("Name and email are required.")
+    if "@" not in payload["email"]:
+        return error("Enter a valid email address.")
+    status = payload.get("status", "lead")
+    if status not in CONTACT_STATUSES:
+        return error("Invalid contact status.")
     record = {
         "name": payload["name"].strip(), "email": payload["email"].strip(),
         "company": payload.get("company", "").strip() or None,
         "title": payload.get("title", "").strip() or None,
-        "status": payload.get("status", "lead"),
+        "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     result = db().table("contacts").insert(record).execute()
@@ -175,12 +198,23 @@ def create_contact():
 
 @app.post("/api/deals")
 def create_deal():
-    payload = request.get_json(force=True)
-    if not payload.get("name", "").strip() or not payload.get("contact_id"):
-        return jsonify({"error": "Deal name and contact are required."}), 400
+    payload = json_body()
+    if payload is None:
+        return error("A JSON deal is required.")
+    if not isinstance(payload.get("name"), str) or not payload["name"].strip() or not payload.get("contact_id"):
+        return error("Deal name and contact are required.")
+    stage = payload.get("stage", "lead")
+    if stage not in DEAL_STAGES:
+        return error("Invalid deal stage.")
+    try:
+        value = float(payload.get("value") or 0)
+    except (TypeError, ValueError):
+        return error("Deal value must be a number.")
+    if value < 0:
+        return error("Deal value cannot be negative.")
     record = {
         "name": payload["name"].strip(), "contact_id": payload["contact_id"],
-        "value": float(payload.get("value") or 0), "stage": payload.get("stage", "lead"),
+        "value": value, "stage": stage,
         "expected_close": payload.get("expected_close") or None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -190,10 +224,29 @@ def create_deal():
 
 @app.patch("/api/deals/<deal_id>")
 def update_deal(deal_id):
-    payload = request.get_json(force=True)
+    payload = json_body()
+    if payload is None:
+        return error("A JSON deal update is required.")
     allowed = {key: payload[key] for key in ("stage", "name", "value", "expected_close") if key in payload}
+    if not allowed:
+        return error("Provide at least one deal field to update.")
+    if "stage" in allowed and allowed["stage"] not in DEAL_STAGES:
+        return error("Invalid deal stage.")
+    if "name" in allowed and (not isinstance(allowed["name"], str) or not allowed["name"].strip()):
+        return error("Deal name cannot be empty.")
+    if "name" in allowed:
+        allowed["name"] = allowed["name"].strip()
+    if "value" in allowed:
+        try:
+            allowed["value"] = float(allowed["value"])
+        except (TypeError, ValueError):
+            return error("Deal value must be a number.")
+        if allowed["value"] < 0:
+            return error("Deal value cannot be negative.")
     allowed["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = db().table("deals").update(allowed).eq("id", deal_id).execute()
+    if not result.data:
+        return error("Deal not found.", 404)
     return jsonify(result.data[0])
 
 
