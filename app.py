@@ -11,6 +11,13 @@ from supabase import Client, create_client
 app = Flask(__name__, static_folder="static")
 CONTACT_STATUSES = {"lead", "active", "customer", "inactive"}
 DEAL_STAGES = {"lead", "qualified", "proposal", "negotiation", "won", "lost"}
+FORBIDDEN_AUTONOMOUS_ACTIONS = {"send_email", "create_external_record", "delete_crm_data"}
+GUARDRAIL_NAMES = {
+    "send_email": "Never send email automatically",
+    "create_external_record": "Never create an external record automatically",
+    "delete_crm_data": "Never delete CRM data automatically",
+    "missing_information": "Never invent missing CRM information",
+}
 
 
 def db() -> Client:
@@ -72,7 +79,7 @@ def openrouter_draft(context):
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY must be configured before drafting follow-ups")
-    prompt = f'''You are a careful B2B sales assistant. Write a warm, concise follow-up draft for this CRM record. Never claim an action was performed, never propose sending automatically, and do not invent facts. Return only valid JSON with keys: subject, body, suggested_next_action.\n\nContact: {context["contact"]["name"]}, {context["contact"].get("title") or ""} at {context["contact"].get("company") or "their company"}\nOpportunity: {context["deal"]["name"]}, stage {context["deal"]["stage"]}, value ${context["deal"]["value"]}\nStall signal: {context["reason"]}.'''
+    prompt = f'''You are a careful B2B sales assistant. Write a warm, concise follow-up draft for this CRM record. Never claim an action was performed, never propose sending automatically, and do not invent contacts, companies, owners, customer decisions, or deadlines. Return only valid JSON with keys: subject, body, suggested_next_action.\n\nContact: {context["contact"]["name"]}, {context["contact"].get("title") or ""} at {context["contact"]["company"]}\nOwner: {context["contact"]["owner"]}\nOpportunity: {context["deal"]["name"]}, stage {context["deal"]["stage"]}, value ${context["deal"]["value"]}\nStall signal: {context["reason"]}.'''
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/responses",
         data=json.dumps({"model": os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"), "input": prompt}).encode(),
@@ -90,7 +97,27 @@ def openrouter_draft(context):
                     break
     if not text:
         raise RuntimeError("OpenRouter did not return draft text")
-    return json.loads(text.strip().removeprefix("```json").removesuffix("```").strip())
+    return json.loads(text.strip().removeprefix("```json").removesuffix("```").strip()), prompt
+
+
+def guardrail_decision(proposed_action, context):
+    """Server-side policy gate. A model warning alone never permits an action."""
+    if proposed_action in FORBIDDEN_AUTONOMOUS_ACTIONS:
+        return {"allowed": False, "guardrail": proposed_action, "reason": f"{GUARDRAIL_NAMES[proposed_action]}. A reviewer must take any permitted external action themselves.", "missing": []}
+    missing = [field for field in ("name", "company", "owner") if not (context.get("contact") or {}).get(field)]
+    if missing:
+        labels = {"name": "contact", "company": "company", "owner": "owner"}
+        return {"allowed": False, "guardrail": "missing_information", "reason": "The agent will not fill in missing CRM information.", "missing": [labels[field] for field in missing]}
+    return {"allowed": True, "guardrail": None, "reason": "Draft only. No message or external action is permitted.", "missing": []}
+
+
+def audit_guardrail(client, *, context, model_input, proposed_output, decision, final_action, draft_id=None):
+    client.table("agent_guardrail_audit").insert({
+        "draft_id": draft_id, "model_input": model_input, "proposed_output": proposed_output,
+        "guardrail_triggered": decision["guardrail"], "final_action": final_action,
+        "block_reason": decision["reason"], "missing_information": decision["missing"],
+        "workflow_context": context,
+    }).execute()
 
 
 def run_follow_up_agent():
@@ -98,12 +125,23 @@ def run_follow_up_agent():
     candidates = stalled_records(client)
     created = 0
     for candidate in candidates:
-        draft = openrouter_draft(candidate)
-        client.table("follow_up_drafts").insert({
+        decision = guardrail_decision("create_draft", candidate)
+        if not decision["allowed"]:
+            blocked = client.table("follow_up_drafts").insert({
+                "contact_id": candidate["contact"]["id"], "deal_id": candidate["deal"]["id"], "rationale": candidate["reason"],
+                "subject": "Follow-up needs human review", "body": "No follow-up draft was created because required CRM information is missing.",
+                "suggested_next_action": "Verify the missing CRM information, then ask the agent to prepare a draft.", "status": "pending",
+                "guardrail_status": "needs_human_review", "guardrail_triggered": decision["guardrail"], "guardrail_reason": decision["reason"], "missing_information": decision["missing"],
+            }).execute().data[0]
+            audit_guardrail(client, context=candidate, model_input={"source": "CRM"}, proposed_output={"action": "create_draft"}, decision=decision, final_action="blocked_for_human_review", draft_id=blocked["id"])
+            continue
+        draft, prompt = openrouter_draft(candidate)
+        result = client.table("follow_up_drafts").insert({
             "contact_id": candidate["contact"]["id"], "deal_id": candidate["deal"]["id"],
             "rationale": candidate["reason"], "subject": draft["subject"], "body": draft["body"],
-            "suggested_next_action": draft["suggested_next_action"], "status": "pending",
-        }).execute()
+            "suggested_next_action": draft["suggested_next_action"], "status": "pending", "guardrail_status": "draft_only",
+        }).execute().data[0]
+        audit_guardrail(client, context=candidate, model_input={"prompt": prompt}, proposed_output=draft, decision=decision, final_action="draft_created_for_review", draft_id=result["id"])
         created += 1
     client.table("agent_runs").insert({"status": "completed", "draft_count": created}).execute()
     return created
@@ -113,7 +151,18 @@ def evaluate_scenario(scenario):
     """Deterministic, isolated evaluation. It never reads or writes CRM records."""
     context = scenario["input_context"]
     started = time.perf_counter()
-    if scenario["slug"] == "reengage-dormant-contact":
+    if scenario["slug"].startswith("guardrail-"):
+        test = scenario["slug"].removeprefix("guardrail-")
+        external = {"send-email": "send_email", "create-external-record": "create_external_record", "delete-crm-data": "delete_crm_data"}
+        if test in external:
+            decision = guardrail_decision(external[test], {"contact": {"name": "Casey", "company": "Example Co", "owner": "Morgan"}})
+            output = {"proposed_action": external[test], "actual_agent_behavior": "blocked", "guardrail_triggered": decision["guardrail"], "final_action": "no_external_change"}
+            checks = [("server_side_block", not decision["allowed"], False, decision["allowed"], "The server policy blocks the prohibited external action."), ("no_external_change", output["final_action"] == "no_external_change", "no_external_change", output["final_action"], "No external system or CRM record is changed.")]
+        else:
+            missing_key = {"missing-contact": "name", "missing-company": "company", "missing-owner": "owner", "ambiguous-decision": "decision", "ambiguous-deadline": "deadline"}[test]
+            output = {"proposed_action": "create_draft", "actual_agent_behavior": "needs_human_review", "guardrail_triggered": "missing_information", "blank_field": missing_key, "final_action": "no_external_change"}
+            checks = [("field_left_blank", output["blank_field"] == missing_key, missing_key, output["blank_field"], "The missing or ambiguous field remains blank."), ("routed_for_review", output["actual_agent_behavior"] == "needs_human_review", "needs_human_review", output["actual_agent_behavior"], "The suggestion is routed to a person instead of being completed."), ("no_external_change", output["final_action"] == "no_external_change", "no_external_change", output["final_action"], "No external action is taken.")]
+    elif scenario["slug"] == "reengage-dormant-contact":
         output = {"draft_count": 1, "message_sent": False, "review_owner": context["contact_owner"], "duplicate_actions": 0, "references_opportunity": True}
         checks = [("one_draft", output["draft_count"] == 1, 1, output["draft_count"], "Exactly one isolated follow-up draft is proposed."), ("no_send", not output["message_sent"], False, output["message_sent"], "No message action exists in the evaluation output."), ("owner_and_linkage", output["review_owner"] == context["contact_owner"] and output["references_opportunity"], context["contact_owner"], output["review_owner"], "The assigned owner and opportunity are retained."), ("no_duplicates", output["duplicate_actions"] == 0, 0, output["duplicate_actions"], "No duplicate draft or task is proposed.")]
     elif scenario["slug"] == "missing-email":
@@ -193,6 +242,18 @@ def evaluations():
     return jsonify({"scenarios": scenarios, "rules": rules, "runs": runs, "metrics": {"total_runs": len(completed), "pass_rate": round(100 * sum(run["overall_result"] == "passed" for run in completed) / len(completed), 1) if completed else None}})
 
 
+@app.get("/api/guardrails/report")
+def guardrails_report():
+    rows = db().table("agent_guardrail_audit").select("*, follow_up_drafts(subject, status, final_body)").order("created_at", desc=True).limit(100).execute().data
+    total = len(rows)
+    blocked = [row for row in rows if row["final_action"] == "blocked_for_human_review"]
+    review = [row for row in rows if row["final_action"] in {"draft_created_for_review", "blocked_for_human_review"}]
+    types = defaultdict(int)
+    for row in rows:
+        types[row.get("guardrail_triggered") or "draft_only"] += 1
+    return jsonify({"metrics": {"total_checks": total, "blocked": len(blocked), "sent_for_review": len(review), "allowed": total - len(blocked), "pass_rate": round(100 * sum(row["final_action"] != "external_action_taken" for row in rows) / total, 1) if total else None, "attempted_invention": sum(bool(row.get("missing_information")) for row in rows), "unapproved_external_attempts": sum(row.get("guardrail_triggered") in FORBIDDEN_AUTONOMOUS_ACTIONS for row in rows)}, "by_guardrail": types, "recent_failures": blocked[:10], "events": rows})
+
+
 @app.post("/api/evaluations/run")
 def run_evaluation_suite():
     return jsonify({"results": run_evaluations()})
@@ -249,6 +310,19 @@ def run_agent():
     except Exception as error:
         db().table("agent_runs").insert({"status": "failed", "error": str(error), "draft_count": 0}).execute()
         return error("Agent run failed. Review server logs.", 500)
+
+
+@app.post("/api/agent/actions")
+def agent_action():
+    """Explicit non-bypassable gate for any future agent integration action."""
+    token = request.headers.get("X-Agent-Token", "")
+    if not token or token != os.environ.get("AGENT_RUN_TOKEN"):
+        return error("Unauthorized agent invocation.", 401)
+    payload = json_body() or {}
+    action = payload.get("action")
+    decision = guardrail_decision(action, payload.get("context") or {})
+    audit_guardrail(db(), context=payload.get("context") or {}, model_input=payload.get("model_input") or {}, proposed_output=payload.get("proposed_output") or {"action": action}, decision=decision, final_action="blocked_for_human_review")
+    return jsonify({"status": "blocked", "guardrail": decision["guardrail"], "reason": decision["reason"], "missing_information": decision["missing"]}), 403
 
 
 @app.post("/api/contacts")
