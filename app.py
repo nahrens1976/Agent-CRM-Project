@@ -203,14 +203,40 @@ def review_follow_up(draft_id):
     payload = json_body()
     if payload is None:
         return error("A JSON decision is required.")
-    decision = payload.get("decision")
-    if decision not in ("approved", "rejected"):
-        return error("Decision must be approved or rejected.")
-    result = db().table("follow_up_drafts").update({"status": decision, "reviewed_at": utcnow().isoformat()}).eq("id", draft_id).eq("status", "pending").execute()
+    action = payload.get("action")
+    valid_actions = {"approved": "approved", "rejected": "rejected", "edited_and_approved": "approved"}
+    reasons = {"incorrect_tone", "incorrect_context", "wrong_owner", "wrong_deadline", "hallucinated_information", "too_generic", "not_useful", "other"}
+    if action not in valid_actions or payload.get("reason") not in reasons:
+        return error("A valid reviewer action and reason are required.")
+    if action == "edited_and_approved" and not payload.get("final_body", "").strip():
+        return error("An edited final version is required.")
+    client = db()
+    original = client.table("follow_up_drafts").select("*").eq("id", draft_id).eq("status", "pending").execute().data
+    if not original:
+        return error("Draft is no longer pending.", 409)
+    updates = {"status": valid_actions[action], "reviewed_at": utcnow().isoformat()}
+    if action == "edited_and_approved":
+        updates.update({"final_subject": payload.get("final_subject", original[0]["subject"]), "final_body": payload["final_body"]})
+    result = client.table("follow_up_drafts").update(updates).eq("id", draft_id).execute()
     if not result.data:
         return error("Draft is no longer pending.", 409)
-    # Approval only records a human decision. This application has no email-sending code or integration.
+    client.table("reviewer_feedback").insert({"draft_id": draft_id, "action": action, "reason": payload["reason"], "note": payload.get("note") or None, "reviewer": payload.get("reviewer") or "Manual reviewer", "final_subject": updates.get("final_subject"), "final_body": updates.get("final_body")}).execute()
+    # Review records a decision only. This application has no email-sending code or integration.
     return jsonify(result.data[0])
+
+
+@app.get("/api/reviewer-feedback/report")
+def reviewer_feedback_report():
+    client = db()
+    feedback = client.table("reviewer_feedback").select("*, follow_up_drafts(workflow, team, model, prompt_version)").order("created_at", desc=True).limit(100).execute().data
+    total = len(feedback)
+    actions = {key: sum(row["action"] == key for row in feedback) for key in ("approved", "rejected", "edited_and_approved")}
+    reasons = defaultdict(int)
+    for row in feedback: reasons[row["reason"]] += 1
+    high_risk = [row for row in feedback if row["reason"] in {"hallucinated_information", "wrong_owner", "wrong_deadline"}]
+    weekly = sorted(reasons.items(), key=lambda item: item[1], reverse=True)[:3]
+    recommendations = [{"pattern": key, "count": count, "risk": "High" if key in {"hallucinated_information", "wrong_owner", "wrong_deadline"} else "Moderate", "recommendation": "Propose a versioned prompt/context/evaluation change for human approval; do not release it automatically."} for key, count in weekly]
+    return jsonify({"rates": {key: round(100 * value / total, 1) if total else 0 for key, value in actions.items()}, "reasons": reasons, "high_risk_failures": high_risk, "recent_failures": [row for row in feedback if row["action"] != "approved"], "weekly_summary": recommendations, "feedback": feedback})
 
 
 @app.post("/api/agent/run")
