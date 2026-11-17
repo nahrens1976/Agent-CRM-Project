@@ -37,6 +37,13 @@ Create an autonomous, approval-based CRM follow-up agent that runs each morning 
 6. Avoid duplicate pending drafts for the same contact.
 7. Keep the OpenRouter key server-side and never expose it to the browser.
 
+## Non-negotiable guardrails
+
+- The agent may analyze CRM data and create internal, reviewable drafts only. It must never send email, create external records, or delete CRM data automatically. Server-side policy must block these actions even if a model proposes them.
+- The agent must never invent contacts, companies, owners, customer decisions, or deadlines. When any required information is missing or ambiguous, leave it blank, explain what is missing, and route the suggestion for human review.
+- Every guardrail decision must be recorded with the model input, proposed output, triggered guardrail, final action, and business-friendly blocking reason. Approval records a human decision only; it never sends email.
+- Keep deterministic guardrail evaluation cases and automated tests for prohibited external actions and missing or ambiguous CRM information.
+
 ## Verification expectations
 
 - Verify database changes with a read query and security advisor checks.
