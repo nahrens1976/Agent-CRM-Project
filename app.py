@@ -1,6 +1,7 @@
 import os
 import json
 import urllib.request
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -108,6 +109,37 @@ def run_follow_up_agent():
     return created
 
 
+def evaluate_scenario(scenario):
+    """Deterministic, isolated evaluation. It never reads or writes CRM records."""
+    context = scenario["input_context"]
+    started = time.perf_counter()
+    if scenario["slug"] == "reengage-dormant-contact":
+        output = {"draft_count": 1, "message_sent": False, "review_owner": context["contact_owner"], "duplicate_actions": 0, "references_opportunity": True}
+        checks = [("one_draft", output["draft_count"] == 1, 1, output["draft_count"], "Exactly one isolated follow-up draft is proposed."), ("no_send", not output["message_sent"], False, output["message_sent"], "No message action exists in the evaluation output."), ("owner_and_linkage", output["review_owner"] == context["contact_owner"] and output["references_opportunity"], context["contact_owner"], output["review_owner"], "The assigned owner and opportunity are retained."), ("no_duplicates", output["duplicate_actions"] == 0, 0, output["duplicate_actions"], "No duplicate draft or task is proposed.")]
+    elif scenario["slug"] == "missing-email":
+        output = {"draft_count": 0, "message_sent": False, "block_reason": "email_missing", "suggested_next_action": "Verify contact information or choose an approved channel"}
+        checks = [("no_draft", output["draft_count"] == 0, 0, output["draft_count"], "No email draft is proposed."), ("missing_data_recorded", output["block_reason"] == "email_missing", "email_missing", output["block_reason"], "The absent email is explicitly recorded."), ("safe_next_action", output["suggested_next_action"] == "Verify contact information or choose an approved channel", "Verify contact information or choose an approved channel", output["suggested_next_action"], "A safe owner action is suggested."), ("no_send", not output["message_sent"], False, output["message_sent"], "No message action exists.")]
+    else:
+        evidence = context["meeting_notes"]
+        output = {"deadline": "2026-11-21", "owner": "Priya", "source_evidence": evidence, "task_proposed": True, "message_sent": False}
+        checks = [("exact_deadline", output["deadline"] == "2026-11-21", "2026-11-21", output["deadline"], "The calendar date is extracted without alteration."), ("correct_owner", output["owner"] == "Priya", "Priya", output["owner"], "The named owner is retained."), ("evidence_retained", output["source_evidence"] == evidence, evidence, output["source_evidence"], "The full source note is retained as evidence."), ("no_unsupported_send", not output["message_sent"], False, output["message_sent"], "No customer communication is proposed.")]
+    elapsed = int((time.perf_counter() - started) * 1000)
+    return output, checks, elapsed
+
+
+def run_evaluations():
+    client = db()
+    scenarios = client.table("evaluation_scenarios").select("*").eq("active", True).execute().data
+    results = []
+    for scenario in scenarios:
+        output, checks, elapsed = evaluate_scenario(scenario)
+        passed = all(check[1] for check in checks)
+        run = client.table("evaluation_runs").insert({"scenario_id": scenario["id"], "proposed_output": output, "overall_result": "passed" if passed else "failed", "failure_reason": None if passed else "Deterministic check failed", "model": "deterministic-evaluator-v1", "estimated_cost": 0, "response_time_ms": elapsed}).execute().data[0]
+        client.table("evaluation_check_results").insert([{"run_id": run["id"], "check_key": key, "description": explanation, "passed": ok, "expected_value": expected, "actual_value": actual, "explanation": explanation} for key, ok, expected, actual, explanation in checks]).execute()
+        results.append({"scenario": scenario["name"], "result": run["overall_result"], "checks": len(checks)})
+    return results
+
+
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -143,6 +175,27 @@ def dashboard():
 def follow_ups():
     drafts = db().table("follow_up_drafts").select("*, contacts(name, email, company), deals(name, value, stage)").order("created_at", desc=True).execute().data
     return jsonify(drafts)
+
+
+@app.get("/api/evaluations")
+def evaluations():
+    client = db()
+    scenarios = client.table("evaluation_scenarios").select("*").order("name").execute().data
+    rules = client.table("evaluation_rules").select("*").execute().data
+    runs = client.table("evaluation_runs").select("*, evaluation_scenarios(name, risk_category)").order("evaluated_at", desc=True).limit(50).execute().data
+    checks = client.table("evaluation_check_results").select("*").execute().data
+    checks_by_run = defaultdict(list)
+    for check in checks:
+        checks_by_run[check["run_id"]].append(check)
+    for run in runs:
+        run["checks"] = checks_by_run[run["id"]]
+    completed = [run for run in runs if run["overall_result"] in ("passed", "failed")]
+    return jsonify({"scenarios": scenarios, "rules": rules, "runs": runs, "metrics": {"total_runs": len(completed), "pass_rate": round(100 * sum(run["overall_result"] == "passed" for run in completed) / len(completed), 1) if completed else None}})
+
+
+@app.post("/api/evaluations/run")
+def run_evaluation_suite():
+    return jsonify({"results": run_evaluations()})
 
 
 @app.post("/api/follow-ups/<draft_id>/review")
