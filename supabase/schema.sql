@@ -57,3 +57,26 @@ revoke all on public.follow_up_drafts, public.agent_runs from anon, authenticate
 create policy "No direct client access to drafts" on public.follow_up_drafts for all to anon, authenticated using (false) with check (false);
 create policy "No direct client access to agent runs" on public.agent_runs for all to anon, authenticated using (false) with check (false);
 
+-- Agent guardrails: every AI proposal is auditable and no browser role can access audit data directly.
+alter table public.contacts add column if not exists owner text;
+alter table public.follow_up_drafts add column if not exists guardrail_status text not null default 'draft_only';
+alter table public.follow_up_drafts add column if not exists guardrail_triggered text;
+alter table public.follow_up_drafts add column if not exists guardrail_reason text;
+alter table public.follow_up_drafts add column if not exists missing_information jsonb not null default '[]'::jsonb;
+create table if not exists public.agent_guardrail_audit (
+  id uuid primary key default gen_random_uuid(),
+  draft_id uuid references public.follow_up_drafts(id) on delete set null,
+  model_input jsonb not null default '{}'::jsonb,
+  proposed_output jsonb not null default '{}'::jsonb,
+  guardrail_triggered text,
+  final_action text not null,
+  block_reason text not null,
+  missing_information jsonb not null default '[]'::jsonb,
+  workflow_context jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists agent_guardrail_audit_created_at_idx on public.agent_guardrail_audit(created_at desc);
+alter table public.agent_guardrail_audit enable row level security;
+revoke all on public.agent_guardrail_audit from anon, authenticated;
+create policy "No direct client access to guardrail audit" on public.agent_guardrail_audit for all to anon, authenticated using (false) with check (false);
+
